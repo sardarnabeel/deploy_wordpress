@@ -1,38 +1,36 @@
-name: Deploy to Amazon ECS
+name: Deploy WordPress and MySQL to Amazon ECS
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      destroy:
-        description: "Trigger Terraform destroy"
-        required: true
-        default: "false"
+
 permissions:
-      id-token: write
-      contents: read
+  id-token: write
+  contents: read
 
 jobs:
   deploy:
-    if: github.event.inputs.destroy != 'true'  # Skip this job if destroy is requested
-    name: Deploy
+    name: Deploy WordPress and MySQL to ECS
     runs-on: ubuntu-latest
-    # environment: production
     env:
-      # AWS_REGION: us-west-2                
-      ECR_REPOSITORY: my-ecr-repo        
-      ECS_SERVICE: my-ecs-service              
-      ECS_CLUSTER: my-ecs-cluster       
-      ECS_CONTAINER_DEFINITION: my-task-family
-      ECS_CONTAINER_NAME: my-container
-      # AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
-    
-     
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      ECR_REPOSITORY_WORDPRESS: wordpress-ecr-repo
+      ECR_REPOSITORY_MYSQL: mysql-ecr-repo
+      ECS_SERVICE: wordpress-ecs-service
+      ECS_CLUSTER: wordpress-ecs-cluster
+      ECS_TASK_FAMILY: wordpress-task-family
+      ECS_CONTAINER_NAME_WORDPRESS: wordpress-container
+      ECS_CONTAINER_NAME_MYSQL: mysql-container
+      MYSQL_ROOT_PASSWORD: ${{ secrets.MYSQL_ROOT_PASSWORD }}
+      MYSQL_DATABASE: wordpress_db
+      MYSQL_USER: wordpress_user
+      MYSQL_PASSWORD: ${{ secrets.MYSQL_PASSWORD }}
+
     steps:
-    - name: Checkout
+    - name: Checkout code
       uses: actions/checkout@v3
+
     - name: Set up Terraform
       uses: hashicorp/setup-terraform@v2
       with:
@@ -45,21 +43,17 @@ jobs:
       run: terraform validate
 
     - name: Terraform Plan
-      run: terraform plan -out=tfplan
+      run: terraform plan
       env:
-        TF_VAR_access_key: ${{ secrets.DEPLOY_AWS_ACCESS_KEY_ID }}
-        TF_VAR_secret_key: ${{ secrets.DEPLOY_AWS_SECRET_ACCESS_KEY }}
-        # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        TF_VAR_aws_access_key: ${{ secrets.DEPLOY_AWS_ACCESS_KEY_ID }}
+        TF_VAR_aws_secret_key: ${{ secrets.DEPLOY_AWS_SECRET_ACCESS_KEY }}
 
     - name: Terraform Apply
-      # run: terraform apply --var-file terraform.tfvars -auto-approve
-      run: terraform apply  -auto-approve tfplan
+      run: terraform apply --var-file terraform.tfvars -auto-approve
       env:
-        TF_VAR_access_key: ${{ secrets.DEPLOY_AWS_ACCESS_KEY_ID }}
-        TF_VAR_secret_key: ${{ secrets.DEPLOY_AWS_SECRET_ACCESS_KEY }}
-        # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        TF_VAR_aws_access_key: ${{ secrets.DEPLOY_AWS_ACCESS_KEY_ID }}
+        TF_VAR_aws_secret_key: ${{ secrets.DEPLOY_AWS_SECRET_ACCESS_KEY }}
+
     - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v1
       with:
@@ -71,54 +65,84 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v1
 
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: ${{ github.sha }}
+    - name: Pull Docker Hub images
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-    - name: Download task definition
-      run: |
-          aws ecs describe-task-definition --task-definition ${{ env.ECS_CONTAINER_DEFINITION }} \
-          --query taskDefinition > task-definition.json
+        docker pull wordpress:latest
+        docker pull mysql:latest
 
-    - name: Fill in the new image ID in the Amazon ECS task definition
-      id: task-def
+    - name: Tag and push Docker images to Amazon ECR
+      run: |
+        # Tag and push WordPress image
+        docker tag wordpress:latest ${{ steps.login-ecr.outputs.registry }}/wordpress:latest
+        docker push ${{ steps.login-ecr.outputs.registry }}/wordpress:latest
+
+        # Tag and push MySQL image
+        docker tag mysql:latest ${{ steps.login-ecr.outputs.registry }}/mysql:latest
+        docker push ${{ steps.login-ecr.outputs.registry }}/mysql:latest
+
+    - name: Download current ECS task definition
+      run: |
+        aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_FAMILY }} \
+        --query taskDefinition > task-definition.json
+
+    - name: Update ECS task definition with new images and environment variables
+      id: render-task-def
       uses: aws-actions/amazon-ecs-render-task-definition@v1
       with:
-          task-definition: task-definition.json
-          container-name: ${{ env.ECS_CONTAINER_NAME }}
-          image: ${{ steps.build-image.outputs.image }}
+        task-definition: task-definition.json
+        container-name: ${{ env.ECS_CONTAINER_NAME_WORDPRESS }}
+        image: ${{ steps.login-ecr.outputs.registry }}/wordpress:latest
+        environment: |
+          [
+            {
+              "name": "WORDPRESS_DB_HOST",
+              "value": "mysql-container"
+            },
+            {
+              "name": "WORDPRESS_DB_NAME",
+              "value": "${{ env.MYSQL_DATABASE }}"
+            },
+            {
+              "name": "WORDPRESS_DB_USER",
+              "value": "${{ env.MYSQL_USER }}"
+            },
+            {
+              "name": "WORDPRESS_DB_PASSWORD",
+              "value": "${{ env.MYSQL_PASSWORD }}"
+            }
+          ]
+        
+    - name: Update ECS task definition with MySQL image and environment variables
+      id: render-task-def-mysql
+      uses: aws-actions/amazon-ecs-render-task-definition@v1
+      with:
+        task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+        container-name: ${{ env.ECS_CONTAINER_NAME_MYSQL }}
+        image: ${{ steps.login-ecr.outputs.registry }}/mysql:latest
+        environment: |
+          [
+            {
+              "name": "MYSQL_ROOT_PASSWORD",
+              "value": "${{ env.MYSQL_ROOT_PASSWORD }}"
+            },
+            {
+              "name": "MYSQL_DATABASE",
+              "value": "${{ env.MYSQL_DATABASE }}"
+            },
+            {
+              "name": "MYSQL_USER",
+              "value": "${{ env.MYSQL_USER }}"
+            },
+            {
+              "name": "MYSQL_PASSWORD",
+              "value": "${{ env.MYSQL_PASSWORD }}"
+            }
+          ]
 
-    - name: Deploy Amazon ECS task definition
+    - name: Deploy ECS task definition
       uses: aws-actions/amazon-ecs-deploy-task-definition@v1
       with:
-        task-definition: ${{ steps.task-def.outputs.task-definition }}
+        task-definition: ${{ steps.render-task-def.outputs.task-definition }}
         service: ${{ env.ECS_SERVICE }}
         cluster: ${{ env.ECS_CLUSTER }}
         wait-for-service-stability: true
-  destroy:
-    if: github.event.inputs.destroy == 'true'  # Trigger this job if destroy is requested
-    name: Destroy
-    runs-on: ubuntu-latest
-    environment: production
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Set up AWS credentials for Terraform
-        env:
-          TF_VAR_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          TF_VAR_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_region: "us-west-2"
-        run: terraform init
-
-      - name: Terraform Destroy
-        env:
-          TF_VAR_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          TF_VAR_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          TF_VAR_region: "us-west-2"
-        run: terraform destroy --var-file=terraform.tfvars -auto-approve
